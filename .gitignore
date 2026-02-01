@@ -6,3 +6,7 @@ __pycache__/
 .env
 dist/
 build/
+backend/reports/
+backend/chroma_db/
+backend/manuals/
+.vscode/

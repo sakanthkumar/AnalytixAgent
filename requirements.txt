@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+python-multipart
 pandas
 numpy
 matplotlib
@@ -7,8 +8,11 @@ seaborn
 requests
 python-dotenv
 langchain
+langchain-community
+langchain-core
+langchain-text-splitters
 chromadb
 pypdf
 duckduckgo-search
-langchain-community
-langchain-core
+pydantic
+openai

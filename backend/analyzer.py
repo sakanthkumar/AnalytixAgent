@@ -80,9 +80,15 @@ def auto_eda(df: pd.DataFrame):
         # Current upload endpoint falls back to df.shape[0]. Let's match that to avoid UI glitch.
         failure_count = df.shape[0]
 
+    # Calculate Failure Rate
+    failure_rate = 0.0
+    if df.shape[0] > 0:
+        failure_rate = round((failure_count / df.shape[0]) * 100, 2)
+
     summary = {
         "shape": df.shape,
         "failure_count": failure_count,
+        "failure_rate": failure_rate,
         "columns": df.columns.tolist(),
         "dtypes": df.dtypes.astype(str).to_dict(),
         "missing_values": df.isnull().sum().to_dict(),
@@ -130,102 +136,132 @@ def auto_eda(df: pd.DataFrame):
     # Final Recursive Cleaning
     return clean_for_json(summary)
 
-def analyze_failure_modes(df: pd.DataFrame):
+def get_failure_stats(df: pd.DataFrame):
     """
-    Deterministic analysis of failure modes.
-    Finds columns that flag failures and summarizes them.
+    Returns raw dictionary of failure statistics.
     """
-    # 1. Identify Failure Column
     possible_cols = ["Machine failure", "Failure", "Target", "failure", "target"]
     target_col = next((c for c in possible_cols if c in df.columns), None)
     
     if not target_col:
-        return "No specific failure label column identified (e.g., 'Target', 'Failure'). Cannot categorize failures automatically."
+        return {"error": "No target column found"}
 
-    # 2. Filter to failures
-    failures = df[df[target_col] == 1]
-    total_failures = len(failures)
+    total_records = len(df)
+    total_failures = int(df[target_col].sum())
     
-    if total_failures == 0:
-        return "No failures found in the dataset."
-
-    report_lines = [f"### Analysis Result"]
-    report_lines.append(f"**Total Failures Detected**: {total_failures}")
-    
-    # 3. Correlation / Co-occurrence
-    # Check other binary columns (Failure Types usually are binary flags like 'TWF', 'HDF', etc.)
-    # We look for columns that are 1 when Target is 1
-    
-    potential_modes = []
-    # Get all numeric columns that look binary (min=0, max=1, unique<=2)
+    modes = []
+    # Identify Failure Modes
     for col in df.columns:
         if col == target_col: continue
         if pd.api.types.is_numeric_dtype(df[col]):
-            if df[col].nunique() <= 2 and df[col].min() >= 0 and df[col].max() <= 1:
-                # Calculate how many times this mode is active during failure
-                count = failures[col].sum()
+            unique_vals = set(df[col].dropna().unique())
+            if unique_vals.issubset({0, 1, 0.0, 1.0}):
+                count = int(df[col].sum())
                 if count > 0:
-                    potential_modes.append((col, int(count)))
+                    pct = (count / total_failures * 100) if total_failures > 0 else 0
+                    modes.append({"name": col, "count": count, "percent": pct})
     
-    # Sort by count desc
-    potential_modes.sort(key=lambda x: x[1], reverse=True)
+    modes.sort(key=lambda x: x["count"], reverse=True)
     
-    if potential_modes:
-        report_lines.append("\n**Breakdown by Failure Mode:**")
-        for mode, count in potential_modes:
-            pct = (count / total_failures) * 100
-            report_lines.append(f"- **{mode}**: {count} ({pct:.1f}%)")
+    return {
+        "total_records": total_records,
+        "total_failures": total_failures,
+        "modes": modes
+    }
+
+def analyze_failure_modes(df: pd.DataFrame):
+    stats = get_failure_stats(df)
+    if "error" in stats:
+        return "No specific failure label column identified. Cannot categorize failures automatically."
+        
+    total_failures = stats["total_failures"]
+    if total_failures == 0:
+        return "No failures found in the dataset."
+
+    report = [f"### Analysis Result"]
+    report.append(f"**Total Failures Detected**: {total_failures}")
+    
+    if stats["modes"]:
+        report.append("\n**Breakdown by Failure Mode:**")
+        count_sum = 0
+        for m in stats["modes"]:
+            report.append(f"- **{m['name']}**: {m['count']} ({m['percent']:.1f}%)")
+            count_sum += m['count']
+            
+        if count_sum < total_failures:
+            report.append(f"\n> **Warning**: The sum of failure modes ({count_sum}) is less than total failures ({total_failures}). Some failures may be uncategorized or unlabeled.")
     else:
-        report_lines.append("\nNo specific binary failure type columns found. Failures may be unlabeled.")
+        report.append("\nNo specific binary failure type columns found. Failures may be unlabeled.")
 
-    report_lines.append("\n*This analysis was generated instantly based on dataset statistics.*")
-    return "\n".join(report_lines)
+    report.append("\n*This analysis was generated instantly based on dataset statistics.*")
+    return "\n".join(report)
 
-def analyze_correlations(df: pd.DataFrame):
+def get_correlation_stats(df: pd.DataFrame):
     """
-    Analyzes correlations between the failure column and sensors.
-    Returns a textual summary of what drives failures.
+    Returns raw correlation data.
     """
     possible_cols = ["Machine failure", "Failure", "Target", "failure", "target"]
     target_col = next((c for c in possible_cols if c in df.columns), None)
     
     if not target_col:
-        return "No failure label found (Machine failure/Target). Cannot analyze root cause."
-
-    summary = ["### Statistical Root Cause Analysis"]
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-    
-    # 1. Direct Correlations
-    try:
-        corrs = df[numeric_cols].corrwith(df[target_col]).sort_values(ascending=False)
-        top_corr = corrs[abs(corrs) > 0.1].drop(target_col, errors='ignore') # Threshold 0.1
+        return {"error": "No target column"}
         
-        if not top_corr.empty:
-            summary.append("**Top Correlated Factors (1.0 = Perfect Cause):**")
-            for col, val in top_corr.head(5).items():
-                summary.append(f"- {col}: {val:.2f}")
-        else:
-            summary.append("No strong linear correlations found with failure.")
-
-        # 2. Distribution Shift (Mean difference)
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    stats = {"top_correlations": [], "shifts": []}
+    
+    try:
+        # 1. Correlations
+        corrs = df[numeric_cols].corrwith(df[target_col]).sort_values(ascending=False)
+        top_corr = corrs[abs(corrs) > 0.1].drop(target_col, errors='ignore')
+        
+        for col, val in top_corr.head(5).items():
+            stats["top_correlations"].append({"feature": col, "value": val})
+            
+        # 2. Shifts
         failures = df[df[target_col] == 1]
         normal = df[df[target_col] == 0]
         
         if not failures.empty and not normal.empty:
-            summary.append("\n**Sensor Behavior During Failure:**")
             for col in numeric_cols:
                 if col == target_col or "id" in col.lower(): continue
-                
                 fail_mean = failures[col].mean()
                 norm_mean = normal[col].mean()
-                
-                # Check for significant difference (>10% shifts)
                 if norm_mean != 0:
                     pct_diff = ((fail_mean - norm_mean) / norm_mean) * 100
-                    if abs(pct_diff) > 5: # Report >5% shifts
-                        direction = "HIGHER" if pct_diff > 0 else "LOWER"
-                        summary.append(f"- {col}: {abs(pct_diff):.1f}% {direction} during failure (Avg: {fail_mean:.1f} vs {norm_mean:.1f})")
+                    if abs(pct_diff) > 5:
+                        stats["shifts"].append({
+                            "feature": col,
+                            "pct_diff": pct_diff,
+                            "fail_mean": fail_mean,
+                            "norm_mean": norm_mean
+                        })
     except Exception as e:
-        summary.append(f"Could not calculate correlations: {str(e)}")
+        return {"error": str(e)}
+        
+    return stats
 
+def analyze_correlations(df: pd.DataFrame):
+    stats = get_correlation_stats(df)
+    if "error" in stats:
+        if stats["error"] == "No target column":
+            return "No failure label found (Machine failure/Target). Cannot analyze root cause."
+        return f"Could not calculate correlations: {stats['error']}"
+        
+    summary = ["### Statistical Root Cause Analysis"]
+    
+    # Corrs
+    if stats["top_correlations"]:
+        summary.append("**Top Correlated Factors (1.0 = Perfect Cause):**")
+        for item in stats["top_correlations"]:
+            summary.append(f"- {item['feature']}: {item['value']:.2f}")
+    else:
+        summary.append("No strong linear correlations found with failure.")
+        
+    # Shifts
+    if stats["shifts"]:
+        summary.append("\n**Sensor Behavior During Failure:**")
+        for item in stats["shifts"]:
+            direction = "HIGHER" if item['pct_diff'] > 0 else "LOWER"
+            summary.append(f"- {item['feature']}: {abs(item['pct_diff']):.1f}% {direction} during failure (Avg: {item['fail_mean']:.1f} vs {item['norm_mean']:.1f})")
+            
     return "\n".join(summary)

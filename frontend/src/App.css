@@ -422,3 +422,30 @@ input[type="text"]:focus {
 }
 
 /* But actually ag-grid has specific themes. We will use className switching */
+
+.spinner-small {
+  border: 2px solid var(--bg-input);
+  border-top: 2px solid var(--primary-color);
+  border-radius: 50%;
+  width: 16px;
+  height: 16px;
+  animation: spin 1s linear infinite;
+  display: inline-block;
+  margin-left: 10px;
+}
+
+.fade-in {
+  animation: fadeIn 0.3s ease-in;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

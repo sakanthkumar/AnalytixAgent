@@ -6,7 +6,7 @@ import uvicorn
 import os
 import json
 from agent import agent_instance as agent
-from analyzer import auto_eda, generate_plots
+from analyzer import auto_eda, generate_plots, clean_for_json, get_failure_stats, get_correlation_stats
 from reporting import get_failures, save_report, list_reports, get_report
 
 app = FastAPI()
@@ -20,13 +20,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DATASTORE = {}
-
+# Analysis Cache: Stores pre-computed reports for instant access
+# Structure: { "why": "Report Text...", "fix": "Report Text..." }
 # Analysis Cache: Stores pre-computed reports for instant access
 # Structure: { "why": "Report Text...", "fix": "Report Text..." }
 ANALYSIS_CACHE = {}
 
+DATASTORE = {}
+
+# Store for user-defined acronyms
+DATASTORE["acronyms"] = {}
+
 import threading
+from tools import search_web
+
+
 
 def run_background_analysis(df, machine_name):
     """
@@ -34,47 +42,136 @@ def run_background_analysis(df, machine_name):
     """
     print("Background Analysis Started...")
     
-    # Initialize placeholders - This prevents duplicate runs
+    # Initialize placeholders
     ANALYSIS_CACHE['why'] = "Analyzing..."
     ANALYSIS_CACHE['impact'] = "Analyzing..."
     ANALYSIS_CACHE['fix'] = "Analyzing..."
     
     # 1. Root Cause (Why)
-    # Hybrid Mode: Logic + RAG
     print("Pre-computing Root Cause...")
     try:
         agent.set_df(df, context_data={"machine_name": machine_name})
-        prompt_why = "Diagnose the root cause of the identified failures using the manuals."
-        ANALYSIS_CACHE['why'] = agent.run(prompt_why)
-        print("Root Cause Computed.")
-    except Exception as e:
-        print(f"Error computing Root Cause: {e}")
-        ANALYSIS_CACHE['why'] = f"Analysis Failed: {str(e)}"
-    
-    # 2. Impact Assessment
-    print("Pre-computing Impact...")
-    try:
-        prompt_impact = "What is the operational impact of these failures?"
-        ANALYSIS_CACHE['impact'] = agent.run(prompt_impact)
-        print("Impact Computed.")
-    except Exception as e:
-        print(f"Error computing Impact: {e}")
-        ANALYSIS_CACHE['impact'] = f"Analysis Failed: {str(e)}"
+        
+        # Build Statistical Context
+        f_stats = get_failure_stats(df)
+        c_stats = get_correlation_stats(df)
+        
+        if "error" in f_stats:
+            ANALYSIS_CACHE['why'] = f"Analysis Skipped: {f_stats['error']}"
+        elif f_stats["total_failures"] == 0:
+            ANALYSIS_CACHE['why'] = "No failures detected. Root cause analysis not required."
+        else:
+            # Build Knowledge Context (Definitions ONLY)
+            knowledge_context = ""
+            if f_stats["modes"]:
+                knowledge_context += "\nSemantic Definitions:\n"
+                for mode in f_stats["modes"]:
+                    name = mode['name']
+                    definition = None
+                    source = None
+                    
+                    # 1. Manuals
+                    rag_hits = kb.search_manuals(f"What does failure mode {name} mean?", k=1)
+                    if rag_hits:
+                        definition = rag_hits[0]
+                        source = "Manuals"
+                    
+                    # 2. User Acronyms
+                    if not definition and name in DATASTORE.get("acronyms", {}):
+                        definition = DATASTORE["acronyms"][name]
+                        source = "User Definition"
+                        
+                    # 3. Web Search
+                    if not definition:
+                        try:
+                            web_res = search_web(f"meaning of {name} failure mode reliability engineering")
+                            if web_res:
+                                definition = web_res[:200]
+                                source = "Web Search"
+                        except: pass
+                            
+                    if definition:
+                        knowledge_context += f"- **{name}**: {definition} [Source: {source}]\n"
+                    else:
+                        knowledge_context += f"- **{name}**: No semantic definition available.\n"
 
-    # 3. Repair Guide (Fix)
-    print("Pre-computing Repair Guide...")
-    try:
-        prompt_fix = "Provide step-by-step repair instructions for this issue."
-        ANALYSIS_CACHE['fix'] = agent.run(prompt_fix)
-        print("Repair Guide Computed.")
+            # Construct Combined Prompt (Data + Knowledge)
+            prompt_failure = f"""
+TASK: Perform a complete Failure Analysis.
+
+DATA CONTEXT:
+Dataset summary:
+- Total records: {f_stats['total_records']}
+- Total failures: {f_stats['total_failures']}
+
+Failure mode breakdown:
+"""
+            for m in f_stats["modes"]:
+                prompt_failure += f"- {m['name']}: {m['count']} ({m['percent']:.1f}%)\n"
+
+            prompt_failure += "\nStatistical observations:\n"
+            if f_stats["modes"]:
+                prompt_failure += f"- Most frequent: {f_stats['modes'][0]['name']}\n"
+            
+            prompt_failure += "\nCorrelation insights:\n"
+            if "top_correlations" in c_stats and c_stats["top_correlations"]:
+                for item in c_stats["top_correlations"]:
+                    prompt_failure += f"  {item['feature']}: {item['value']:.2f}\n"
+
+            prompt_failure += knowledge_context
+
+            # RAG for repair (Global search)
+            hits = kb.search_manuals("Repair procedures for detected failures", k=3)
+            if hits:
+                prompt_failure += "\nMANUAL EXCERPTS:\n" + "\n".join(hits)
+
+            # SINGLE CALL
+            full_report = agent.generate_direct(prompt_failure, system_type="failure")
+            
+            # Store in cache (all keys point to valid report to support legacy endpoints)
+            ANALYSIS_CACHE['combined'] = full_report
+            ANALYSIS_CACHE['why'] = full_report
+            ANALYSIS_CACHE['impact'] = full_report
+            ANALYSIS_CACHE['fix'] = full_report
+            
+        print("Failure Analysis Computed (Combined).")
     except Exception as e:
-        print(f"Error computing Repair: {e}")
-        ANALYSIS_CACHE['fix'] = f"Analysis Failed: {str(e)}"
+        print(f"Error computing Failure Analysis: {e}")
+        ANALYSIS_CACHE['combined'] = f"Analysis Failed: {str(e)}"
     
     print("Background Analysis Complete! Cache populated.")
 
 class Query(BaseModel):
     question: str
+
+class AcronymPayload(BaseModel):
+    acronyms: dict
+
+@app.post("/settings/acronyms")
+def update_acronyms(payload: AcronymPayload):
+    DATASTORE["acronyms"].update(payload.acronyms)
+    return {"message": "Acronyms updated", "total": len(DATASTORE["acronyms"])}
+
+@app.get("/settings/acronyms/unknown")
+def get_unknown_acronyms():
+    df = DATASTORE.get("df")
+    if df is None:
+        return {"error": "No dataset loaded"}
+        
+    stats = get_failure_stats(df)
+    if "error" in stats:
+        return {"unknown": []}
+        
+    unknown = []
+    known = DATASTORE.get("acronyms", {})
+    
+    for m in stats.get("modes", []):
+        name = m["name"]
+        # If not known and looks like an acronym (simple heuristic or just pass all modes)
+        if name not in known:
+            unknown.append(name)
+            
+    return {"unknown": unknown}
 
 from fastapi import Form
 from typing import Optional
@@ -91,33 +188,63 @@ def upload_csv(file: UploadFile = File(...), machine_name: Optional[str] = Form(
         # Clear old cache
         ANALYSIS_CACHE.clear()
         
-        # Start Background Analysis Thread
-        thread = threading.Thread(target=run_background_analysis, args=(df, machine_name))
-        thread.daemon = True # Ensure thread dies if server stops
-        thread.start()
-        
         # Calculate true failures
-        failure_count = 0
-        possible_cols = ["Machine failure", "Failure", "Target", "failure", "target"]
-        found_col = next((c for c in possible_cols if c in df.columns), None)
-        
-        if found_col:
-            failure_count = int(df[found_col].sum())
+        stats = get_failure_stats(df)
+        if "error" in stats:
+             failure_count = df.shape[0] if stats["error"] == "No target column found" else 0
+             unknown = []
         else:
-            # Fallback for unlabeled data (assume row count if unsure, but user said it's wrong)
-            # Better to return 0 or explicitly say standard rows if no failure col found.
-            # Let's default to row count ONLY if no failure column exists, but label it "Rows"
-            failure_count = df.shape[0] 
+             failure_count = stats["total_failures"]
+             # Identify unknown acronyms
+             known = DATASTORE.get("acronyms", {})
+             unknown = []
+             for m in stats.get("modes", []):
+                 if m["name"] not in known:
+                     unknown.append(m["name"])
+
+        # Create status
+        if unknown:
+            status = "waiting_for_definitions"
+            message = "Dataset uploaded. Please define failure modes."
+        else:
+            status = "analysis_started"
+            message = "Dataset uploaded. Analysis starting..."
+            # Start Background Analysis Thread immediately if everything is known
+            thread = threading.Thread(target=run_background_analysis, args=(df, machine_name))
+            thread.daemon = True
+            thread.start()
 
         return {
-            "message": "Dataset uploaded successfully",
+            "message": message,
             "filename": file.filename,
             "rows": df.shape[0],
             "failure_count": failure_count,
-            "columns": df.shape[1]
+            "columns": df.shape[1],
+            "unknown_acronyms": unknown,
+            "status": status
         }
     except Exception as e:
         return {"error": f"Failed to parse CSV: {str(e)}"}
+
+@app.post("/analysis/start")
+def start_analysis():
+    df = DATASTORE.get("df")
+    machine_name = DATASTORE.get("machine_name")
+    
+    if df is None:
+        raise HTTPException(status_code=400, detail="No dataset loaded")
+        
+    # Check if already running? (Optional optimization)
+    # We just restart/overwrite the thread. Python threads can't be killed easily, 
+    # but run_background_analysis checks cache keys so it might overlap.
+    # However, for this single-user local app, it's fine.
+    
+    thread = threading.Thread(target=run_background_analysis, args=(df, machine_name))
+    thread.daemon = True
+    thread.start()
+    
+    return {"message": "Analysis started", "status": "started"}
+
 
 
 from analyzer import auto_eda, generate_plots, clean_for_json
@@ -293,6 +420,59 @@ def get_single_report(report_id: str):
     if data:
         return data
     raise HTTPException(status_code=404, detail="Report not found")
+
+# --- Settings API ---
+
+@app.get("/settings/config")
+def get_settings_config():
+    conf = agent.get_config()
+    conf["rag_depth"] = kb.n_results
+    return conf
+
+@app.get("/settings/models")
+def get_settings_models():
+    return {"models": agent.get_available_models()}
+
+class ModelUpdate(BaseModel):
+    model: str
+
+@app.post("/settings/model")
+def update_settings_model(update: ModelUpdate):
+    msg = agent.set_model(update.model)
+    return {"message": msg, "current_model": agent.model}
+
+class TempUpdate(BaseModel):
+    temperature: float
+
+@app.post("/settings/temperature")
+def update_settings_temp(update: TempUpdate):
+    msg = agent.set_temperature(update.temperature)
+    return {"message": msg, "temperature": agent.temperature}
+
+@app.post("/manuals/clear")
+def clear_manuals_kb():
+    success, msg = kb.clear_index()
+    if success:
+        return {"message": msg}
+    else:
+        raise HTTPException(status_code=500, detail=msg)
+
+class ExpertConfig(BaseModel):
+    system_prompt: str = None
+    ollama_url: str = None
+
+@app.post("/settings/expert")
+def update_expert_settings(config: ExpertConfig):
+    msg = agent.set_config(config.dict(exclude_none=True))
+    return {"message": msg}
+
+class RagUpdate(BaseModel):
+    n_results: int
+
+@app.post("/settings/rag")
+def update_rag_settings(update: RagUpdate):
+    msg = kb.set_depth(update.n_results)
+    return {"message": msg, "depth": kb.n_results}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

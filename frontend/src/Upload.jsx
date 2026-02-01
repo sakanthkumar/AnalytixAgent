@@ -15,8 +15,8 @@ function Upload({ onUploadSuccess }) {
       form.append("machine_name", machineName);
     }
     try {
-      await axios.post("http://localhost:8000/upload", form);
-      if (onUploadSuccess) onUploadSuccess();
+      const res = await axios.post("http://localhost:8000/upload", form);
+      if (onUploadSuccess) onUploadSuccess(res.data);
     } catch (e) {
       console.error(e);
       alert("Upload failed");

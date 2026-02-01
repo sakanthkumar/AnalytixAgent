@@ -7,6 +7,7 @@ import Manuals from "./Manuals";
 import Sidebar from "./Sidebar";
 import Header from "./Header";
 import Reports from './Reports';
+import Settings from './Settings';
 import "./App.css";
 
 // Markdown Renderer
@@ -26,10 +27,9 @@ const ReportView = ({ text }) => {
 export default function Dashboard() {
   const [data, setData] = useState(null);
   const [plots, setPlots] = useState(null);
-  const [report, setReport] = useState(null);
+  const [reports, setReports] = useState({});
   const [reportLoading, setReportLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('dashboard');
-
   const [showFailures, setShowFailures] = useState(false);
   const [failures, setFailures] = useState([]);
 
@@ -47,6 +47,50 @@ export default function Dashboard() {
     } catch (e) { console.error(e); }
   };
 
+
+  const [showAcronymModal, setShowAcronymModal] = useState(false);
+  const [unknownAcronyms, setUnknownAcronyms] = useState([]);
+  const [acronymInputs, setAcronymInputs] = useState({});
+
+
+
+  const startAnalysis = async () => {
+    try {
+      await axios.post("http://localhost:8000/analysis/start");
+      // Optional: Add toast "Analysis Started"
+      console.log("Analysis started in background");
+    } catch (e) {
+      console.error("Failed to start analysis", e);
+    }
+  };
+
+  const handleUploadSuccess = (uploadData) => {
+    fetchEDA();
+    setActiveTab('dashboard');
+
+    if (uploadData && uploadData.unknown_acronyms && uploadData.unknown_acronyms.length > 0) {
+      setUnknownAcronyms(uploadData.unknown_acronyms);
+      setShowAcronymModal(true);
+    } else {
+      // No missing definitions, start immediately
+      startAnalysis();
+    }
+  };
+
+  const handleAcronymSubmit = async () => {
+    try {
+      await axios.post("http://localhost:8000/settings/acronyms", { acronyms: acronymInputs });
+      setShowAcronymModal(false);
+      alert("Definitions saved! Analysis starting...");
+      startAnalysis();
+    } catch (e) { alert("Failed to save definitions"); }
+  };
+
+  const handleAcronymSkip = () => {
+    setShowAcronymModal(false);
+    startAnalysis();
+  };
+
   // Data Fetching
   const fetchEDA = async () => {
     setReportLoading(false); // No auto-loading
@@ -57,7 +101,11 @@ export default function Dashboard() {
       ]);
 
       if (edaRes.data.error) setData(null);
-      else setData(edaRes.data);
+      else {
+        setData(edaRes.data);
+        // We do NOT check checkAcronyms() here anymore, because upload handler does it.
+        // checkAcronyms(); 
+      }
 
       if (!plotsRes.data.error) setPlots(plotsRes.data);
     } catch (e) {
@@ -65,38 +113,42 @@ export default function Dashboard() {
     }
   };
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { fetchEDA(); }, []);
 
   // Manual Analysis Handler
   const runAnalysis = async (type) => {
     setReportLoading(true);
-    setReport(null);
-    let question = "";
-    if (type === 'what') question = "List the failure modes found in the data and their counts. Provide a summary of the distribution.";
-    if (type === 'why') question = "Diagnose the root cause of the identified failures using the manuals.";
-    if (type === 'impact') question = "What is the operational impact if this failure persists?";
-    if (type === 'fix') question = "Provide step-by-step repair instructions for this issue.";
+    // Don't clear previous reports, just add/update
 
     try {
       if (type === 'what') {
         // ULTRA-FAST PATH: Use deterministic Python analysis
         const res = await axios.get("http://localhost:8000/analysis/fast_failure");
-        if (res.data.answer) setReport(res.data.answer);
+        if (res.data.answer) {
+          setReports(prev => ({ ...prev, 'Failure Identification': res.data.answer }));
+        }
         loadFailures(); // Auto-open logs
       } else {
         // CACHED PATH: Fetch pre-computed analysis
         const res = await axios.get(`http://localhost:8000/analysis/report?type=${type}`);
-        if (res.data.answer) setReport(res.data.answer);
+
+        const titles = { why: "AI Reliability Report", impact: "AI Reliability Report", fix: "AI Reliability Report" };
+        const title = titles[type] || "Analysis Report";
+
+        if (res.data.answer) {
+          setReports(prev => ({ ...prev, [title]: res.data.answer }));
+        }
       }
     } catch (e) {
-      setReport("Analysis failed. Please check backend connection.");
+      alert("Analysis failed. Please check backend connection.");
     } finally {
       setReportLoading(false);
     }
   };
 
   // View Components
-  const DashboardView = () => {
+  const renderDashboard = () => {
     // State lifted to parent
 
     if (!data) return (
@@ -104,7 +156,7 @@ export default function Dashboard() {
         <div className="upload-area">
           <h3>Start New Analysis</h3>
           <p>Upload your machine logs (CSV) to begin diagnosis.</p>
-          <Upload onUploadSuccess={() => { fetchEDA(); setActiveTab('dashboard'); }} />
+          <Upload onUploadSuccess={handleUploadSuccess} />
         </div>
       </div>
     );
@@ -120,11 +172,42 @@ export default function Dashboard() {
             <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
               <button className="primary-btn" onClick={() => runAnalysis('what')}>🔍 Identify Failures</button>
               <button className="secondary-btn" onClick={loadFailures} style={{ borderColor: 'var(--danger-color)', color: 'var(--danger-color)' }}>📋 View Failure Log</button>
-              <button className="primary-btn" onClick={() => runAnalysis('why')}>🧪 Root Cause</button>
-              <button className="primary-btn" onClick={() => runAnalysis('impact')}>⚠️ Impact Assessment</button>
-              <button className="primary-btn" style={{ backgroundColor: 'var(--accent-color)' }} onClick={() => runAnalysis('fix')}>🔧 Repair Guide</button>
+              <button className="primary-btn" style={{ backgroundColor: 'var(--accent-color)', width: '100%' }} onClick={() => runAnalysis('why')}>🧠 Generate AI Reliability Report</button>
             </div>
           </section>
+
+          {/* Acronym Definition Modal */}
+          {showAcronymModal && (
+            <div className="modal-overlay">
+              <div className="modal-content" style={{ maxWidth: '600px' }}>
+                <header className="modal-header">
+                  <h2 style={{ color: 'var(--primary-color)' }}>🧠 Define Failure Modes</h2>
+                  <button className="close-btn" onClick={handleAcronymSkip}>Skip</button>
+                </header>
+                <div style={{ padding: '1rem 0' }}>
+                  <p>The system detected undefined acronyms by the backend. Please identify them for accurate analysis.</p>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '1rem' }}>
+                    {unknownAcronyms.map(acronym => (
+                      <div key={acronym} style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                        <strong style={{ minWidth: '60px' }}>{acronym}:</strong>
+                        <input
+                          type="text"
+                          placeholder={`Meaning of ${acronym}...`}
+                          value={acronymInputs[acronym] || ''}
+                          style={{ flex: 1, padding: '8px', borderRadius: '4px', border: '1px solid #ccc' }}
+                          onChange={(e) => setAcronymInputs(prev => ({ ...prev, [acronym]: e.target.value }))}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '1rem' }}>
+                  <button className="secondary-btn" onClick={handleAcronymSkip}>Skip Definitions</button>
+                  <button className="primary-btn" onClick={handleAcronymSubmit}>Save & Improve Analysis</button>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Failure List Modal */}
           {showFailures && (
@@ -159,19 +242,29 @@ export default function Dashboard() {
 
           {/* Report Section */}
           <section className="section-box" style={{ borderLeft: '4px solid var(--accent-color)', minHeight: '100px' }}>
-            <h3>📝 AI Reliability Report</h3>
-            {reportLoading ? (
-              <div style={{ padding: '20px', textAlign: 'center' }}>
-                <div className="spinner" style={{ margin: '0 auto 10px' }}></div>
-                <span style={{ color: 'var(--text-muted)' }}>Analyzing data & knowledge base...</span>
-              </div>
-            ) : report ? <ReportView text={report} /> : <p style={{ fontStyle: 'italic', color: 'var(--text-muted)' }}>Select a module above to generate a report.</p>}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h3>📝 AI Reliability Report</h3>
+              {reportLoading && <span className="spinner-small"></span>}
+            </div>
+
+            {Object.keys(reports).length === 0 && !reportLoading && (
+              <p style={{ fontStyle: 'italic', color: 'var(--text-muted)' }}>Select a module above to generate a report.</p>
+            )}
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+              {Object.entries(reports).map(([title, content]) => (
+                <div key={title} className="report-card fade-in" style={{ backgroundColor: 'var(--bg-primary)', padding: '15px', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
+                  <h4 style={{ borderBottom: '1px solid var(--border-color)', paddingBottom: '10px', marginBottom: '10px', color: 'var(--primary-color)' }}>{title}</h4>
+                  <ReportView text={content} />
+                </div>
+              ))}
+            </div>
           </section>
 
           {/* KPI Cards */}
           <section className="cards-grid">
             <div className="card"><h3>Total Failures</h3><p style={{ fontSize: '2rem', fontWeight: 'bold' }}>{data.failure_count ?? data.shape[0]}</p></div>
-            <div className="card"><h3>Machines</h3><p style={{ fontSize: '2rem', fontWeight: 'bold' }}>{data.shape[1]}</p></div>
+            <div className="card"><h3>Failure Rate</h3><p style={{ fontSize: '2rem', fontWeight: 'bold' }}>{data.failure_rate}%</p></div>
             <div className="card"><h3>Missing Data</h3><p style={{ fontSize: '2rem', fontWeight: 'bold' }}>{Object.values(data.missing_values).reduce((a, b) => a + b, 0)}</p></div>
           </section>
 
@@ -208,7 +301,7 @@ export default function Dashboard() {
       <div className="main-content-area">
         <Header title={activeTab.charAt(0).toUpperCase() + activeTab.slice(1)} />
         <main className="scrollable-content">
-          {activeTab === 'dashboard' && <DashboardView />}
+          {activeTab === 'dashboard' && renderDashboard()}
           {activeTab === 'analysis' && (
             <div className="container" style={{ maxWidth: '600px', margin: '0 auto' }}>
               <h2>New Analysis</h2>
@@ -222,7 +315,7 @@ export default function Dashboard() {
           {activeTab === 'logs' && !data && <p style={{ textAlign: 'center', marginTop: '3rem' }}>No data available.</p>}
           {activeTab === 'reports' && <Reports />}
           {activeTab === 'manuals' && <Manuals />}
-          {activeTab === 'settings' && <div style={{ textAlign: 'center', marginTop: '3rem', color: 'var(--text-muted)' }}>Settings Module Coming Soon</div>}
+          {activeTab === 'settings' && <Settings />}
         </main>
       </div>
     </div>
